@@ -1,0 +1,540 @@
+SOCK_RAW демеcтификация
+by ithilgore - ithilgore.ryu.L@gmail.com
+sock-raw.org / sock-raw.homeunix.org
+May 2008
+
+
+0x0. Индекс
+0x1. Введение
+0x2. Создание
+0x3. IP_HDRINCL
+0x4. raw ввод
+0x5. raw вывод
+0x6. Описание
+0x7. Заключение
+0x8. Ссылки
+
+0x1. Введение
+=================
+
+Цель данного исследования - это объяснение, довольно часто не понимаемой  природы raw
+sockets(сырых сокетов).  Движущей силой для написания этого текста было любопытство 
+автора - в изучении всех тонкостей этого мощного типа сокетов, также изветного как 
+SOCK_RAW.  То о чем здесь будет вестись рассказ - это не очередное руководство по 
+созданию своего типа пакетов. Данная тема была много раз обговорена и в сети можно легко
+найти несколько ссылок об этом. Здесь будет описано - что делает  RAW_SOCKET 
+"за сценой". Поэтой причине мы углубимся в реализацию сетевого стека. Мы предполагаем,
+что читатель уже имеет опыт по работе с сокетами и сможет читать исходные код ядра ОС,
+поскольку реализация сырых сокетов,в данный момент, отличается от одной операционной 
+системы к другой. Мы обсудим реализацию от FreeBSD 7.0 и Linux 2.6. В большинстве 
+случаев примеры для  FreeBSD так же применимы к  OpenBSD, NetBSD и даже  к MAC OS X.
+
+0x2. Cоздание
+=============
+
+Сначала - начало(обо всем по порядку). Создание. Как создается сырой сокет? Какие 
+основные сложности? Сырой сокет создается системным вызовом socket(2)  и определяет тип
+сокета как SOCK_RAW, как здесь:
+	int fd = socket(AF_INET, SOCK_RAW, XXX);
+где, XXX - это *int protocol*, и как мы и обсудим далее - это главный источник непонимая 
+и проблем, выходящиe из самого факта что здесь могут быть применены различные 
+комбинации.  Валидные значения: IPPROTO_ICMP, IPPOROTO_IGMP, IPPROTO_TCP, 0 (здесь 
+осторожно - см. ниже), IPPROTO_UDP и тд. Различныe комбинации - различное поведение.
+И это поведение - критично при взаимодействии ядра с приложением создавшим  сырой сокет.
+
+Прежде чем вдаваться в подробности комбинаций для каждой ОС, давайте для начала 
+посмотрим на актуальное значение значения - протокол. Для работы всех протоколов 
+одновременно, был использован  общий подход к дизайну протоколов.  Основываясь на этом 
+похожие протоколы сгруппированы в домены. Домен как правило определяется - Protocol 
+Family или Address Family ( последнее более современная практика ) и постоянными числами
+используемыми для различия между ними. Наиболее распространенные из них:
+
+PF_INET / AF_INET 			--> Internet protocols (TCP, UDP etc)
+PF_LOCAL, PF_UNIX / AF_LOCAL, AF_UNIX	--> Unix local IPC protocol
+PF_ROUTE / AF_ROUTE 			--> routing tables 
+
+Linux определяет эти константы в /usr/src/linux-2.6.*/include/linux/socket.h
+
+/* Supported address families. */
+#define AF_UNSPEC	0
+#define AF_UNIX		1	/* Unix domain sockets 		*/
+#define AF_LOCAL	1	/* POSIX name for AF_UNIX	*/
+#define AF_INET		2	/* Internet IP Protocol 	*/
+  	/* ... */
+
+/* Protocol families, same as address families. */
+#define PF_UNSPEC	AF_UNSPEC
+#define PF_UNIX		AF_UNIX
+#define PF_LOCAL	AF_LOCAL
+#define PF_INET		AF_INET
+ 	/* ... */
+
+FreeBSD отпределяет эти значения ( почти так же ) в /usr/src/sys/sys/socket.h
+
+Как вы уже могли предположить, мы будем заниматься AF_INET. AF_INET делится на типы 
+протоколов которые  могут состоять из более чем одного протокола. 
+
+Linux определяет тип протоколов AF_INET в /usr/src/linux-2.6.*/include/linux/net.h
+
+enum sock_type {
+	SOCK_STREAM	= 1,
+	SOCK_DGRAM	= 2,
+	SOCK_RAW	= 3,
+	SOCK_RDM	= 4,
+	SOCK_SEQPACKET	= 5,
+	SOCK_DCCP	= 6,
+	SOCK_PACKET	= 10,
+};
+
+FreeBSD /usr/src/sys/sys/socket.h
+
+/*
+ * Types
+ */
+#define	SOCK_STREAM	1		/* stream socket */
+#define	SOCK_DGRAM	2		/* datagram socket */
+#define	SOCK_RAW	3		/* raw-protocol interface */
+#if __BSD_VISIBLE
+#define	SOCK_RDM	4		/* reliably-delivered message */
+#endif
+#define	SOCK_SEQPACKET	5		/* sequenced packet stream */
+
+Если вы уже имеетe опыт программирования сокетов, тогда возможно вы узнали кое-что
+из представленного выше. Один из них является вторым аргументом в системном вызове 
+socket(AF_INET, ..., ...). Третий аргумент это IPPROTO_XXX значение которое определяет 
+протокол выше IP. Важно понять смысл этого значения. Это значение\номер которое IP 
+уровень будет писать в поле protocol_type заголовка для определения верхнеуровнего 
+заголовка. 
+Это поле "Protocol" как вы видите в IP заголовокe ниже (RFC 791).
+
+    0                   1                   2                   3   
+    0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |Version|  IHL  |Type of Service|          Total Length         |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |         Identification        |Flags|      Fragment Offset    |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |  Time to Live |    Protocol   |         Header Checksum       |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |                       Source Address                          |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |                    Destination Address                        |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |                    Options                    |    Padding    |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+Это одно из наиболее важных полей, поскольку только его будет использовать IP уровень на
+принимаемой стороне для определения какого типа датаграмма вышестоящего уровня 
+доставлена( например TCP или UDP ).
+
+Linux определяет эти протоколы в /usr/src/linux-2.6.*/include/linux/in.h
+
+/* Standard well-defined IP protocols.  */
+enum {
+	IPPROTO_IP = 0,			/* Dummy protocol for TCP		*/
+	IPPROTO_ICMP = 1,		/* Internet Control Message Protocol	*/
+	IPPROTO_IGMP = 2,		/* Internet Group Management Protocol	*/
+	IPPROTO_IPIP = 4,		/* IPIP tunnels (older KA9Q tunnels use 94) */
+	IPPROTO_TCP = 6,		/* Transmission Control Protocol	*/
+	IPPROTO_EGP = 8,		/* Exterior Gateway Protocol		*/
+	IPPROTO_PUP = 12,		/* PUP protocol				*/
+	IPPROTO_UDP = 17,		/* User Datagram Protocol		*/
+	IPPROTO_IDP = 22,		/* XNS IDP protocol			*/
+	IPPROTO_DCCP = 33,		/* Datagram Congestion Control Protocol */
+	IPPROTO_RSVP = 46,		/* RSVP protocol			*/
+	IPPROTO_GRE = 47,		/* Cisco GRE tunnels (rfc 1701,1702)	*/
+	IPPROTO_IPV6 = 41,		/* IPv6-in-IPv4 tunnelling		*/
+	IPPROTO_ESP = 50,       	/* Encapsulation Security Payload protocol */
+	IPPROTO_AH = 51,             	/* Authentication Header protocol       */
+	IPPROTO_BEETPH = 94,	       	/* IP option pseudo header for BEET */
+	IPPROTO_PIM    = 103,		/* Protocol Independent Multicast	*/
+	IPPROTO_COMP   = 108,           /* Compression Header protocol */
+	IPPROTO_SCTP   = 132,		/* Stream Control Transport Protocol	*/
+	IPPROTO_UDPLITE = 136,		/* UDP-Lite (RFC 3828)			*/
+	IPPROTO_RAW	 = 255,		/* Raw IP packets			*/
+	IPPROTO_MAX
+};
+
+FreeBSD /usr/src/sys/netinet/in.h
+
+Пример для IPPROTO_RAW:
+
+#if __POSIX_VISIBLE >= 200112
+#define	IPPROTO_RAW		255		/* raw IP packet */
+#define	INET_ADDRSTRLEN		16
+#endif
+
+С таким количеством комбинаций лучше обсуждать вещи последовательно. Итак  начнем 
+с наиболее используемого значения 0 в поле протокол. Вы когда-нибудь задумывались 
+как системный вызов syscall(2) магическим образом определяет какой протокол 
+использовать если он был вызван как socket(..., ..., 0)?
+Например когда приложение вызывает его так:
+
+	socket(AF_INET, SOCK_STREAM, 0);
+
+Как ядро находит какой протокол ассоциировать с сокетом? Факт то, что ядро не делает 
+никаких предположений - ядро не играет в кости c userspace ( цитируя сумашедшего 
+медика и великую голову http://www.quotedb.com/quotes/878 в слегка измененном контексте)
+- в большинстве случаев( см. encryption & entropy для противоположной парадигмы)
+На FreeBSD все что делается - это ассоциируется первый  протокол найденный в списке 
+слинкованных доменов, с помощью функции pffindproto(dom, type).
+
+Давайте будем более конкретными и рассмотрим немого PoC (proof of concept) кода:
+
+Сокет создается с помощью функции ядра socreate()  которая определяется так:
+(исходный код из FreeBSD 7.0 /usr/src/sys/kern/uipc_socket.c)
+
+
+/*
+ * socreate returns a socket with a ref count of 1.  The socket should be
+ * closed with soclose().
+ */
+int
+socreate(int dom, struct socket **aso, int type, int proto,
+    struct ucred *cred, struct thread *td)
+{
+	struct protosw *prp;
+	struct socket *so;
+	int error;
+
+	if (proto)
+		prp = pffindproto(dom, proto, type);
+	else
+		prp = pffindtype(dom, type); 
+
+	/* .... */
+}
+
+
+Секрет лжи в двух функциях pffindproto() и pffindtype(). Если  proto == 0 тогда 
+вызывается pffindtype, которая менее строгая чем pffindproto(). Как мы можем выдеть из
+исходного кода, pffindtype() не делает проверку proto совсем и просто возвращает 
+*первую* структуру protosw которую находит, выводя это просто из pr_type( protocol 
+type: SOCK_STREAM , SOCK_DGRAM, SOCK_RAW etc ) и family/domain ( AF_INET, AF_LOCAL 
+и т.д. )
+Каждая структура protosw (protoco switch) это соотношение SOCK_XXX type и IPPROTO_XXX
+protocol.  Все protosw структуры внутри таблицы  inetsw[], на которую указывает 
+inetdomain в глобальном списке доменов.
+Графическое представление может немного прояснить ситуацию:
+
+domains:
+---------
+|	|			(domain linked list)
+---------
+    |
+    |------------> 	isodomain:             	inetdomain:
+			---------      		--------- 
+		-------	|	| -----> -------|	| ------->    .....
+		|	---------      	 |	---------
+		|	               	 |	
+		|		       	 |		
+		|---> isosw[]:         	 |---> inetsw[]:
+			---------      		---------
+			|	|      		|  IP	|
+			---------      		---------
+			|	|      		|  UDP	|
+			---------      		---------
+			|	|      		|  TCP	|
+			---------      		---------
+			|	|      		|IP(raw)| (default entry)
+			---------      		---------
+			|	|      		| ICMP	|
+			---------      		---------
+				       		| IGMP	|	
+                                                ---------
+						|  ...  |
+						---------
+						|  ...  |
+						---------
+				       		|IP(raw)| (wildcard entry)
+                                                ---------
+Замечание: Размещение IP(raw) в 4ом индексе(inetsw[3]) упомянуто по историческим 
+причинам и новые реализации FreeBSD стэка отличаются в этом отношении. В частности,
+если объявлена  поддержка SCTP ядром тогда IP(raw), ICMP и оставшиеся переезжают на
+3 позиции верх таблица  inetsw[] фактически становится inetsw[6], inetsw[7] и т.д
+Конечно это не имеет никаких определенных различий в ядре поскольку inetsw[] никогда
+не доступен по индексу только по имени. Во всем тексте мы будем использовать соглашение
+ссылающееся на значение по умолчанию (inetsw[3]) как default_RAW и wildcard RAW 
+значение ( последнее значение inetsw[] и устаревшее inetsw[6]) как wildcard_RAW для 
+ясности.
+
+Запись raw wildcard ( у которого для .pr_protocol не установлено значение и таким 
+образом имеющее значение 0 ) определяется как последний член inetsw[] массива в
+/usr/src/sys/netinet/in_proto.h:
+
+/* raw wildcard */
+{
+	.pr_type =		SOCK_RAW,
+	.pr_domain =		&inetdomain,
+	.pr_flags =		PR_ATOMIC|PR_ADDR,
+	.pr_input =		rip_input,
+	.pr_ctloutput =		rip_ctloutput,
+	.pr_init =		rip_init,
+	.pr_usrreqs =		&rip_usrreqs
+},
+};  /* end of inetsw[] */
+
+Вернемся к поиску, который происходит так:
+	pffindtype: 	1. найти соответсвующий домен через значение *family*
+			2. вернуть первое вхождение соответсвующей protosw таблицы
+			которое совпадает сo значением *type*
+	pffindproto: 	1. найти соответсвующий домен через значение *family*
+			2. вернуть первое совпадение пары *type* - *protocol*
+			3. если пары не найдено и тип SOCK_RAW тогда вернуть значение 
+			по умолчанию raw IP - default_RAW ( см. ниже)
+
+Обе функции возвращают вхождение inetsw[] ( указатель на соответcвующее смещение в 
+массиве )
+
+/usr/src/sys/kernel/uipc_domain.c:
+
+struct protosw *
+pffindtype(int family, int type)
+{
+	struct domain *dp;
+	struct protosw *pr;
+
+	for (dp = domains; dp; dp = dp->dom_next)
+		if (dp->dom_family == family)
+			goto found;
+	return (0);
+found:
+	for (pr = dp->dom_protosw; pr < dp->dom_protoswNPROTOSW; pr++)
+		if (pr->pr_type && pr->pr_type == type)
+			return (pr);
+	return (0);
+}
+
+struct protosw *
+pffindproto(int family, int protocol, int type)
+{
+	struct domain *dp;
+	struct protosw *pr;
+	struct protosw *maybe = 0;
+
+	if (family == 0)
+		return (0);
+	for (dp = domains; dp; dp = dp->dom_next)
+		if (dp->dom_family == family)
+			goto found;
+	return (0);
+found:
+	for (pr = dp->dom_protosw; pr < dp->dom_protoswNPROTOSW; pr++) {
+		if ((pr->pr_protocol == protocol) && (pr->pr_type == type))
+			return (pr);
+
+		if (type == SOCK_RAW && pr->pr_type == SOCK_RAW &&
+		    pr->pr_protocol == 0 && maybe == (struct protosw *)0)
+			maybe = pr;
+	}
+	return (maybe);
+}
+
+Исследуя представленный выше код, мы замечаем другое важное значение SOCK_RAW.
+В основном , что делают последние несколько строк pffindproto() - это используют
+SOCK_RAW как резервный протокол поумолчанию. Это означает, что если пользовательское 
+приложение вызывает socket(2) вот так:
+	
+	socket(AF_INET, SOCK_RAW, 30);
+
+где значение protocol - 30, не оговорено в ядре, но вместо ошибки, используется
+wildcard_RAW. Потому, что только структура protosw в массиве inetsw[] содержит 
+.pr_protocol - 0 и pr_type - SOCK_RAW.
+Тоже самое происходит при вызове:
+
+	socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
+
+Тип SOCK_RAW и IPPROTO_TCP не совпадают, поскольку SOCK_RAW имеет записи только для
+ICMP, IGMP и raw IP. Однако этот вызов прекрасно работает, поскольку ядро вернет  
+wildcard запись SOCK_RAW.
+
+Это работает для FreeBSD. Насколько это касается Linux, вы можете уже заметить из 
+обрывка кода выше (in.h), значение *0* уже определено как другой тип протокола для TCP.
+Эта имеет достаточно сильное значение в портировании приложений между *BSD и Linux. 
+Для примера, для *BSD это верно:
+
+	socket(AF_INET, SOCK_RAW, 0);
+
+Обратите внимание, что при вводе значения 0 будет возвращенa запись default_RAW, а не
+wildcard запись, поскольку pffindtype() вернет первую protosw структуру с типом 
+SOCK_RAW внутри  таблицы inetsw[], а первая запись это default_RAW.
+
+На Linux выполучите ошибку EPROTONOSUPPORT. Рассмотрим ниже код ядра ,что-бы понять
+почему это произойдет.
+
+/usr/src/linux-2.6.*/net/ipv4/af_inet.c:
+
+
+/* Upon startup we insert all the elements in inetsw_array[] into
+ * the linked list inetsw.
+ */
+static struct inet_protosw inetsw_array[] =
+{
+	{
+		.type =       SOCK_STREAM,
+		.protocol =   IPPROTO_TCP,
+		.prot =       &tcp_prot,
+		.ops =        &inet_stream_ops,
+		.capability = -1,
+		.no_check =   0,
+		.flags =      INET_PROTOSW_PERMANENT |
+			      INET_PROTOSW_ICSK,
+	},
+
+	{
+		.type =       SOCK_DGRAM,
+		.protocol =   IPPROTO_UDP,
+		.prot =       &udp_prot,
+		.ops =        &inet_dgram_ops,
+		.capability = -1,
+		.no_check =   UDP_CSUM_DEFAULT,
+		.flags =      INET_PROTOSW_PERMANENT,
+       },
+
+
+       {
+	       .type =       SOCK_RAW,
+	       .protocol =   IPPROTO_IP,	/* wild card */
+	       .prot =       &raw_prot,
+	       .ops =        &inet_sockraw_ops,
+	       .capability = CAP_NET_RAW,
+	       .no_check =   UDP_CSUM_DEFAULT,
+	       .flags =      INET_PROTOSW_REUSE,
+       }
+};
+
+
+static int inet_create(struct net *net, struct socket *sock, int protocol)
+{
+
+	/* ... */
+
+/* Look for the requested type/protocol pair. */
+	answer = NULL;
+lookup_protocol:
+	err = -ESOCKTNOSUPPORT;
+	rcu_read_lock();
+	list_for_each_rcu(p, &inetsw[sock->type]) {
+		answer = list_entry(p, struct inet_protosw, list);
+
+		/* Check the non-wild match. */
+		if (protocol == answer->protocol) {
+			if (protocol != IPPROTO_IP)
+				break;
+		} else {
+			/* Check for the two wild cases. */
+			if (IPPROTO_IP == protocol) {
+				protocol = answer->protocol;
+				break;
+			}
+			if (IPPROTO_IP == answer->protocol)
+				break;
+		}
+		err = -EPROTONOSUPPORT;
+		answer = NULL;
+	}
+
+	/* ... */
+
+}
+
+
+Из представленного выше мы помним, что IPPROTO_IP = 0.
+Код представленный выше может быть разбит на:
+
+1) socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	protocol = 6
+	answer = inet_protosw[0]
+	protocol = answer->protocol  : first "if" TRUE
+	OK
+
+2) socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	protocol = 17 
+	answer = inet_protosw[1]
+	protocol = answer->protocol : first "if" TRUE
+	OK
+
+3) socket(AF_INET, SOCK_STREAM, 0);
+	protocol = 0
+	answer = inet_protosw[0]
+	if (protocol == answer->protocol) : FALSE
+	check else : 
+			/* Check for the two wild cases. */
+			if (IPPROTO_IP == protocol) {
+				protocol = answer->protocol;
+				break;
+			}
+			: TRUE
+	обратите внимение , что значение protocol замещено реальным значением
+	IPPROTO_TCP в строке:
+		protocol = answer->protocol;
+	OK
+
+4) socket(AF_INET, SOCK_DGRAM, 0);
+	protocol = 0
+	answer = inet_protosw[1]
+	if (protocol == answer->protocol) : FALSE
+	check else : 
+			/* Check for the two wild cases. */
+			if (IPPROTO_IP == protocol) {
+				protocol = answer->protocol;
+				break;
+			}
+			: TRUE
+	обратите внимение , что значение protocol замещено реальным значением
+	IPPROTO_UDP в строке:
+		protocol = answer->protocol;
+	OK
+
+5) socket(AF_INET, SOCK_RAW, 0);
+	protocol = 0
+	answer = inet_protosw[2]
+	protocol == IPPROTO_IP so : if (protocol != IPPROTO_IP)  is FALSE
+	not OK -> EPROTONOSUPPORT
+
+6) socket(AF_INET, SOCK_STREAM, 9); (где 9 может быть любым протоколом, за исключением
+				  IPPROTO_TCP)
+   	protocol = 9
+	answer = inet_protosw[0]
+	if (protocol == answer->protocol) : FALSE
+	check else : 
+			/* Check for the two wild cases. */
+			if (IPPROTO_IP == protocol) {
+				protocol = answer->protocol;
+				break;
+			}
+			if (IPPROTO_IP == answer->protocol)
+				break;
+
+	both are a FALSE
+	not OK -> EPROTONOSUPPORT
+
+7) socket(AF_INET, SOCK_DGRAM, 9); (где 9 может быть любым протоколом, за исключением
+				   IPPROTO_UDP)
+	same as above
+	not OK -> EPROTONOSUPPORT
+
+8) socket(AF_INET, SOCK_RAW, 9); (где 9 может быть *любым* протоколом, за исключением 0)
+	protocol = 9
+	answer = inet_protosw[2]
+	if (protocol == answer->protocol) : FALSE
+	check else : 
+			/* Check for the two wild cases. */
+			if (IPPROTO_IP == protocol) {
+				protocol = answer->protocol;
+				break;
+			} 
+			: FALSE
+
+			if (IPPROTO_IP == answer->protocol)
+				break;
+			: TRUE
+	OK
+
+Вариант 8 показывает как Linux использует SOCK_RAW для резервного протокола, так же как
+мы видели использует его FreeBSD.
+
+Это не единственные различия между двумя системами. И мы будем больше разговаривать об 
+этом далее.
+
+
