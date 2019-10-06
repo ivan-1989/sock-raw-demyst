@@ -2,5 +2,5 @@
 
 Translating the paper "SOCK\_RAW Demystified"
 
-# URL
+# URL of paper
 https://sock-raw.org/papers/sock_raw
