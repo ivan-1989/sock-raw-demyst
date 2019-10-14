@@ -1,3 +1,4 @@
+# vim: set textwidth=90:
 SOCK_RAW демеcтификация
 by ithilgore - ithilgore.ryu.L@gmail.com
 sock-raw.org / sock-raw.homeunix.org
