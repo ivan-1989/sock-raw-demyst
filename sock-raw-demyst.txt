@@ -6,12 +6,12 @@ sock-raw.org / sock-raw.homeunix.org
 May 2008
 
 
-0x0. Индекс
+0x0. Оглавление
 0x1. Введение
 0x2. Создание
 0x3. IP_HDRINCL
-0x4. raw ввод
-0x5. raw вывод
+0x4. raw input
+0x5. raw output
 0x6. Описание
 0x7. Заключение
 0x8. Ссылки
@@ -46,7 +46,7 @@ SOCK_RAW.  То о чем здесь будет вестись рассказ - 
 
 Прежде чем вдаваться в подробности комбинаций для каждой ОС, давайте для начала 
 посмотрим на актуальное определение значения - *protocol*. Для работы всех протоколов 
-одновременно, был использован  общий подход к дизайну протоколов.  Основываясь на этом 
+одновременно, был использован  общий подход к дизайну.  Основываясь на этом 
 похожие протоколы сгруппированы в домены. Домен как правило определяется - Protocol 
 Family или Address Family ( последнее более современная практика ) и постоянными числами
 используемыми для различия между ними. Наиболее распространенные из них:
@@ -588,5 +588,257 @@ static int inet_create(struct net *net, struct socket *sock, int protocol)
 
 0x4. raw input
 ==============
+
+После того как мы решили использовать сырые сокеты в нашем приложении, мы заранее знаем
+какие датаграммы мы ожидаем получать. Подход к реализации здесь, совершенно разный у Linux
+и у FreeBSD и заслуживает нашего внимания отдельно.
+
+
+a. Linux
+********
+
+Linux выбрал менее ресурсосберегающий подход. После обработки новой входящей IP датаграммы
+IP уровнем, вызывается  функция ядра ip_local_deliver_finish(), которая отвечает за вызов
+зарегистрированного обработчика траспортного протокола, исследуя поле protocol заголовка
+IP. Однако до того как  доставить датаграмму обработчику, каждый раз проверяется, не было
+ли приложением создано raw сокета с *таким же* номером протокола. Если есть одно или более
+таких приложений, создается копия датаграммы и также доставляется им.
+
+
+/usr/src/linux-2.6.*/net/ipv4/ip_input.c
+
+static int ip_local_deliver_finish(struct sk_buff *skb)
+{
+	__skb_pull(skb, ip_hdrlen(skb));
+
+	/* Point into the IP datagram, just past the header. */
+	skb_reset_transport_header(skb);
+
+	rcu_read_lock();
+	{
+		/* Note: See raw.c and net/raw.h, RAWV4_HTABLE_SIZE==MAX_INET_PROTOS */
+		int protocol = ip_hdr(skb)->protocol;
+		int hash;
+		struct sock *raw_sk;
+		struct net_protocol *ipprot;
+
+	resubmit:
+		hash = protocol & (MAX_INET_PROTOS - 1);
+		raw_sk = sk_head(&raw_v4_htable[hash]);
+
+		/* If there maybe a raw socket we must check - if not we
+		 * don't care less
+		 */
+		if (raw_sk && !raw_v4_input(skb, ip_hdr(skb), hash))
+			raw_sk = NULL;
+
+	/* ... */
+	/* transport protocol handler calling */
+	/* ... */
+
+}
+
+Вопрос который здесь возникает - разве не вся датаграмма передается raw сокету? Только
+данные IP или вся IP датаграмма(вместе с IP заголовком). Рассмотрев внимательнее код
+представленный выше, мы можем вывести, что передается вся IP датаграмма. Давайте посмотрим
+почему:
+
+Во первых мы имеем:
+
+__skb_pull(skb, ip_hdrlen(skb));
+
+Что здесь делается по факту - сдвигается указатель sk_buff на указатель ниже IP
+заголовка( не смотря на то, что это звучит как разногласие с тем, что мы вывели выше,
+подождите с возникающими возражениями до того как вы дочитаете всю часть полностью).  Это
+добавляет размер ip_hdrlen(skb) к skb->data. Это значит, что skb_data теперь указывает на
+IP payload - и поскольку пакет направляется вверх по сетевому стеку, начало IP payload это
+на самом деле начало транспортного заголовка ( скорее всего TCP )
+
+__skb_pull is defined in:
+/usr/src/linux-2.6.*/include/linux/skbuff.h
+
+static inline unsigned char *__skb_pull(struct sk_buff *skb, unsigned int len)
+{
+	skb->len -= len;
+	BUG_ON(skb->len < skb->data_len);
+	return skb->data += len;
+}
+
+После  __skb_pull мы получаем другую  skb-relevant функцию  которая вызывается:
+
+skb_reset_transport_header(skb);
+
+которая обновляет часть структуры skb skb->transport_header  в указатель на новое место
+skb->data указывающий до - угадайте что - транспортного заголовка.
+
+skb_reset_transport_header(skb) объявляется в:
+/usr/src/linux-2.6.*/include/linux/skbuff.h
+
+static inline void skb_reset_transport_header(struct sk_buff *skb)
+{
+	skb->transport_header = skb->data;
+}
+
+Наша  sk_buff структура будет сейчас выглядеть так:
+
+sk_buff {			    buffer
+				-------------- 	
+.skb_data                       |	     |
+	|                       --------------
+        |                       | IP header  | <----
+        |                       --------------     |
+        -----------------> ->	| IP payload |     |
+	                   |    |	     |     |
+.transport_header ---------|    |	     |     |
+	                        --------------	   |	
+.network_header ------------------------------------
+
+}
+
+Чтож в этой части мы видим , что  *вся* IP датаграмма ( вместе с IP заголовком )
+отправляется пользовательскому процессу который создал raw сокет ?
+Введите raw_v4_input(). 
+
+По имени можно предположить , что это главный обработчик raw сокетов и он вызывается в
+ip_local_deliver_finish():
+
+	if (raw_sk && !raw_v4_input(skb, ip_hdr(skb), hash))
+
+Обратите внимание на второй аргумент ip_hdr(skb) в  raw_v4_input. ip_hdr  объявляется в 
+/usr/src/linux-2.6.*/include/linux/ip.h:
+
+static inline struct iphdr *ip_hdr(const struct sk_buff *skb)
+{
+	return (struct iphdr *)skb_network_header(skb);
+}
+
+и  skb_network_header объявляется в
+/usr/src/linux-2.6.*/include/linux/skbuff.h:
+
+static inline unsigned char *skb_network_header(const struct sk_buff *skb)
+{
+	return skb->network_header;
+}
+
+Что в основном делается выше - это передается IP заголовок текущего пакета функции
+raw_v4_input как отдельная iphdr структура. Это делается путем приведения данных skbuff
+где skb->network_header указывает (начало IP заголовка) на структуру iphdr.
+
+Пришло время для анализа raw_v4_input:
+
+/usr/src/linux-2.6.*/net/ipv4/raw.c:
+
+/* IP input processing comes here for RAW socket delivery.
+ * Caller owns SKB, so we must make clones.
+ *
+ * RFC 1122: SHOULD pass TOS value up to the transport layer.
+ * -> It does. And not only TOS, but all IP header.
+ */
+int raw_v4_input(struct sk_buff *skb, struct iphdr *iph, int hash)
+{
+	struct sock *sk;
+	struct hlist_head *head;
+	int delivered = 0;
+
+	read_lock(&raw_v4_lock);
+	head = &raw_v4_htable[hash];
+	if (hlist_empty(head))
+		goto out;
+	sk = __raw_v4_lookup(__sk_head(head), iph->protocol,
+			     iph->saddr, iph->daddr,
+			     skb->dev->ifindex);
+
+	while (sk) {
+		delivered = 1;
+		if (iph->protocol != IPPROTO_ICMP || !icmp_filter(sk, skb)) {
+			struct sk_buff *clone = skb_clone(skb, GFP_ATOMIC);
+
+			/* Not releasing hash table! */
+			if (clone)
+				raw_rcv(sk, clone);
+		}
+		sk = __raw_v4_lookup(sk_next(sk), iph->protocol,
+				     iph->saddr, iph->daddr,
+				     skb->dev->ifindex);
+	}
+out:
+	read_unlock(&raw_v4_lock);
+	return delivered;
+}
+
+Обратите внимание на то, что функция __raw_v4_lookup() которая по существу проверяет был
+ли приложением создан сырой сокет с номером протокола указанным в заголовке IP, учитывает
+iph->protocol как и ожидается. Одна из наиболее важных частей приведенного выше кода это
+функция skb_clone() которая вызывается столько раз, сколько прилодений нуждается в копии
+датаграммы. Это реализовано внутри цикла while.  Следующая часть это вызов raw_rcv():
+ 
+int raw_rcv(struct sock *sk, struct sk_buff *skb)
+{
+	if (!xfrm4_policy_check(sk, XFRM_POLICY_IN, skb)) {
+		kfree_skb(skb);
+		return NET_RX_DROP;
+	}
+	nf_reset(skb);
+
+	skb_push(skb, skb->data - skb_network_header(skb));
+
+	raw_rcv_skb(sk, skb);
+	return 0;
+}
+
+Эта функция выполняет две вещи: ( крайне важно, чтобы то что находится ниже понималось,
+поскольку эта часть решает возмоные возражения против нашей мысли о передаче всей  IP
+датаграммы в сырой сокет)
+
+1) Вызовается skb_push(), чтобы вернуть skbuff в его старую форму.
+skb_push() это точная противоположность skb_pull():
+
+/**
+ *	skb_push - add data to the start of a buffer
+ *	@skb: buffer to use
+ *	@len: amount of data to add
+ *
+ *	This function extends the used data area of the buffer at the buffer
+ *	start. If this would exceed the total buffer headroom the kernel will
+ *	panic. A pointer to the first byte of the extra data is returned.
+ */
+static inline unsigned char *skb_push(struct sk_buff *skb, unsigned int len)
+{
+	skb->data -= len;
+	skb->len  += len;
+	if (unlikely(skb->data<skb->head))
+		skb_under_panic(skb, len, current_text_addr());
+	return skb->data;
+}
+
+Итак, сейчас вспомните его аргументы и на что skbuff был похож на диаграмме выше.
+
+	skb_push(skb, skb->data - skb_network_header(skb));
+
+Сейчас skbuff будет выглядеть вот так:
+
+sk_buff {			    buffer
+				-------------- 	
+.skb_data                       |	     |
+	|                       --------------
+        |------------------>    | IP header  | <----
+                                --------------     |
+                           ->	| IP payload |     |
+	                   |    |	     |     |
+.transport_header ---------|    |	     |     |
+	                        --------------	   |	
+.network_header ------------------------------------
+
+}
+
+Вы можете сейчас удивиться, почему часть skb_pull() сверху , если мы собирались повернуть
+назад в любом случае вызывая skb_push() чтобы сделать точно противоложную операцию? Ответ
+на этот вопрос, это то, что сырые сокеты это промежуточное место , где проходят
+датаграммы. В обычном случае, когда не сырые сокеты открыты для какого-то
+IPPROTO_protocol, тогда как пакет передается на верх по сетевому стеку skb_pull() является
+естественным, поскольку пакет медленно избавляется от заголовком нижнего уровня. Однако,
+эти накладные расходы можно избежать возмоным вызовом skb_pull(), после того как механизм
+сырых сокетов подается и таким образом избегая дополнительного skb_push() внутри raw_rcv().
+(Хотя это должно быть проверено).
 
 

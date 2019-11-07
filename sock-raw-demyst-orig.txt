@@ -636,6 +636,7 @@ application has created a raw socket with the *same* protocol number. If there
 is one or more such applications, it makes a copy of the datagram and delivers 
 it to them as well.
 
+
 /usr/src/linux-2.6.*/net/ipv4/ip_input.c
 
 static int ip_local_deliver_finish(struct sk_buff *skb)
