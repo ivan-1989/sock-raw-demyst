@@ -1091,7 +1091,7 @@ The number defined in /usr/src/linux-2.6.*/include/linux/in.h for Linux and
 /usr/src/sys/netinet/in.h for FreeBSD. IPPROTO_XXX. Most protocols have such 
 a global common number.
 
-The inetsw[] table doesn't have the protocol protosw structs arranged by this
+	The inetsw[] table doesn't have the protocol protosw structs arranged by this
 number. For example TCP which is defined to be protocol number 6 is in 
 inetsw[2]. So ip_protox[6] has to point at inetsw[2]. Fairly simple. The same 
 logic goes for all protocols that IP may need to hand datagrams to.

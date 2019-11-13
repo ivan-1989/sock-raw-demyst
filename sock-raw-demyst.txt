@@ -862,3 +862,208 @@ static int raw_rcv_skb(struct sock * sk, struct sk_buff * skb)
 сырой сокет, но также и IP заголовок.
 
 
+b. FreeBSD
+**********
+
+FreeBSD использует другой подход. Сырым сокетам никода не передается TCP или UDP пакет.
+Такие пакеты нужно читать непосредственно с уровня datalink используя такие библиотеки как
+libpcap или bpf API. Так же никогда не передается фрагментированная датаграмма. Каждая
+датаграмма полностью собирается до того как она передастся сырому сокету. 
+FreeBSD передает сырому сокету:
+	a) IP датаграмму с указанным в поле протокол  протоколом не зарегистрированным в
+	ядре
+	b) все IGMP пакеты после того как ядро закончит их обработку
+	с) все ICMP пакеты ( за исключением echo запросов, timestamp запросов и address
+	mask запросов) после того как ядро закончит их обработку
+
+Мы будем изучать первый пример который для нас более интересен. Но до этого, изучим  немного
+вводного материала о том как ядро FreeBSD регистрирует обработчики протоколов.
+
+В части 0x2. Создание, мы упоминали несколько вещей о структурaх protosw которые
+ассоциируют тип SOCK_XXX с протоколом IPPROTO_XXX  и находятся в глобальной таблице
+inetsw[]. Кроме этого, они имеют имеют members, которые указывают на соответствующие
+обработчики протоколов (также называемые hooks). pr_input() отвечает за обработку данных
+от протокола находящегося уровнем ниже, тогда как pr_output() обрабатывает данные
+передающиеся выщестоящему протоколу.
+
+/usr/src/sys/sys/protosw.h:
+
+struct protosw {
+	short	pr_type;		/* socket type used for */
+	struct	domain *pr_domain;	/* domain protocol a member of */
+	short	pr_protocol;		/* protocol number */
+	short	pr_flags;		/* see below */
+/* protocol-protocol hooks */
+	pr_input_t *pr_input;		/* input to protocol (from below) */
+	pr_output_t *pr_output;		/* output to protocol (from above) */
+	pr_ctlinput_t *pr_ctlinput;	/* control input (from below) */
+	pr_ctloutput_t *pr_ctloutput;	/* control output (from above) */
+/* user-protocol hook */
+	pr_usrreq_t	*pr_ousrreq;
+/* utility hooks */
+	pr_init_t *pr_init;
+	pr_fasttimo_t *pr_fasttimo;	/* fast timeout (200ms) */
+	pr_slowtimo_t *pr_slowtimo;	/* slow timeout (500ms) */
+	pr_drain_t *pr_drain;		/* flush any excess space possible */
+
+	struct	pr_usrreqs *pr_usrreqs;	/* supersedes pr_usrreq() */
+};
+
+Так что IP как правило будет вызывать соответствующий обработчик pr_input() когда получит
+пакет, благодаря этой таблице. Для того, что бы знать какой протокол какому обработчику
+передавать, необходима фаза инифиализации. Изначально, все структуры protosw
+инициализируются в /usr/src/sys/netinet/in_proto.c 
+
+Это походит на то, что мы видели ранее на Linux в
+/usr/src/linux-2.6.*/net/ipv4/af_inet.c
+
+struct protosw inetsw[] = {
+{
+	.pr_type =		0,
+	.pr_domain =		&inetdomain,
+	.pr_protocol =		IPPROTO_IP,
+	.pr_init =		ip_init,
+	.pr_slowtimo =		ip_slowtimo,
+	.pr_drain =		ip_drain,
+	.pr_usrreqs =		&nousrreqs
+},
+{
+	.pr_type =		SOCK_DGRAM,
+	.pr_domain =		&inetdomain,
+	.pr_protocol =		IPPROTO_UDP,
+	.pr_flags =		PR_ATOMIC|PR_ADDR,
+	.pr_input =		udp_input,
+	.pr_ctlinput =		udp_ctlinput,
+	.pr_ctloutput =		ip_ctloutput,
+	.pr_init =		udp_init,
+	.pr_usrreqs =		&udp_usrreqs
+},
+{
+	.pr_type =		SOCK_STREAM,
+	.pr_domain =		&inetdomain,
+	.pr_protocol =		IPPROTO_TCP,
+	.pr_flags =		PR_CONNREQUIRED|PR_IMPLOPCL|PR_WANTRCVD,
+	.pr_input =		tcp_input,
+	.pr_ctlinput =		tcp_ctlinput,
+	.pr_ctloutput =		tcp_ctloutput,
+	.pr_init =		tcp_init,
+	.pr_slowtimo =		tcp_slowtimo,
+	.pr_drain =		tcp_drain,
+	.pr_usrreqs =		&tcp_usrreqs
+},
+/* #ifdef SCTP */
+/* ... */
+/* #endif */
+{
+	.pr_type =		SOCK_RAW,
+	.pr_domain =		&inetdomain,
+	.pr_protocol =		IPPROTO_RAW,
+	.pr_flags =		PR_ATOMIC|PR_ADDR,
+	.pr_input =		rip_input,
+	.pr_ctlinput =		rip_ctlinput,
+	.pr_ctloutput =		rip_ctloutput,
+	.pr_usrreqs =		&rip_usrreqs
+},
+{
+	.pr_type =		SOCK_RAW,
+	.pr_domain =		&inetdomain,
+	.pr_protocol =		IPPROTO_ICMP,
+	.pr_flags =		PR_ATOMIC|PR_ADDR|PR_LASTHDR,
+	.pr_input =		icmp_input,
+	.pr_ctloutput =		rip_ctloutput,
+	.pr_usrreqs =		&rip_usrreqs
+},
+{
+	.pr_type =		SOCK_RAW,
+	.pr_domain =		&inetdomain,
+	.pr_protocol =		IPPROTO_IGMP,
+	.pr_flags =		PR_ATOMIC|PR_ADDR|PR_LASTHDR,
+	.pr_input =		igmp_input,
+	.pr_ctloutput =		rip_ctloutput,
+	.pr_init =		igmp_init,
+	.pr_fasttimo =		igmp_fasttimo,
+	.pr_slowtimo =		igmp_slowtimo,
+	.pr_usrreqs =		&rip_usrreqs
+},
+{
+	.pr_type =		SOCK_RAW,
+	.pr_domain =		&inetdomain,
+	.pr_protocol =		IPPROTO_RSVP,
+	.pr_flags =		PR_ATOMIC|PR_ADDR|PR_LASTHDR,
+	.pr_input =		rsvp_input,
+	.pr_ctloutput =		rip_ctloutput,
+	.pr_usrreqs =		&rip_usrreqs
+},
+
+Вопрос в том как IP понимает какой обработчик протокола должен тоже получить пакет? Это
+далется исследуя поле Protocol в заголовке IP (мы говороли об этом выше) и затем  смотря
+таблицу ip_protox[] которая инициализируется в функции ip_init().
+
+/usr/src/sys/netinet/ip_input.c:
+
+void
+ip_init(void)
+{
+	struct protosw *pr;
+	int i;
+
+	TAILQ_INIT(&in_ifaddrhead);
+	in_ifaddrhashtbl = hashinit(INADDR_NHASH, M_IFADDR, &in_ifaddrhmask);
+	pr = pffindproto(PF_INET, IPPROTO_RAW, SOCK_RAW);
+	if (pr == NULL)
+		panic("ip_init: PF_INET not found");
+
+	/* Initialize the entire ip_protox[] array to IPPROTO_RAW. */
+	for (i = 0; i < IPPROTO_MAX; i++)
+		ip_protox[i] = pr - inetsw;
+	/*
+	 * Cycle through IP protocols and put them into the appropriate place
+	 * in ip_protox[].
+	 */
+	for (pr = inetdomain.dom_protosw;
+	    pr < inetdomain.dom_protoswNPROTOSW; pr++)
+		if (pr->pr_domain->dom_family == PF_INET &&
+		    pr->pr_protocol && pr->pr_protocol != IPPROTO_RAW) {
+			/* Be careful to only index valid IP protocols. */
+			if (pr->pr_protocol < IPPROTO_MAX)
+				ip_protox[pr->pr_protocol] = pr - inetsw;
+		}
+/* ... */
+
+}
+
+Массив ip_protox[] это не что иное как простой ассоциативный массив который используется
+IP для демультиплексирования входящих датаграмм основываясь на *реальном* номере протокола
+транспортного уровня. Что мы действительно имеем ввиду? Действительный номер находящийся в
+заголовке IP в поле Protocol - стандартизированный всеми RFC номер. Номер определенный в 
+/usr/src/linux-2.6.*/include/linux/in.h в Linux и в /usr/src/sys/netinet/in.h.
+IPPROTO_XXX. Большинство протоколов имеют такой определенный гловально номер.
+
+
+Таблица inetsw[] не имеет структур протоколов protosw урегулированных по этому номеру.
+Например TCP который определен быть номером протокола 6 в inetsw[2].  Поэтому ip_protox[6]
+указывает на inetsw[2]. Довольно просто. Такая же логика работает для всех протоколов
+которым IP может понадобиться также передать датаграммы.
+Еще одна диаграмма:
+
+	ip_protox[]					inetsw[]
+
+	---------					---------
+0       |   3	|                               	|  IP	|
+        ---------                               	---------
+1       |   4	|-------------------------|           	|  UDP	|
+        ---------                         |      	---------
+2	|   5	|------|         |-------------------> 	|  TCP	|
+        ---------      |         |        |      	---------
+3	|   	|      |         |        |      	|IP(raw)| (default)
+	---------      |         |        |      	---------
+4	|	|      |         |        |---------> 	| ICMP	|
+        ---------      |         |                	---------
+5	|	|      |-----------------------------> 	| IGMP	| 
+        ---------		 |                      ---------
+6	|   3	|----------------|               	|  ...  | 
+	---------                                       ---------
+7	|	|					|  ...  |
+	---------					---------
+...	|  ...  |					|IP(raw)| (wildcard)
+	---------					---------
