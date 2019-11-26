@@ -1119,3 +1119,116 @@ bad:
 	m_freem(m);
 }
 
+Сейчас допустим, что что ip->ip_p ( поле Protocol в ip заголовке ) это , что-то , что *не
+имеет*  зарегистрированного обработчика в ядре. 
+Что будет вызывать слудующая строчка из ip_input()?
+
+	(*inetsw[ip_protox[ip->ip_p]].pr_input)(m, hlen);
+
+Вы правильно предполагаете. pr_input of inetsw[default_RAW] (SOCK_RAW - IPPROTO_RAW).
+Пришло время разобраться с rip_input().
+
+
+/usr/src/sys/netinet/raw_ip.c:
+
+/*
+ * Setup generic address and protocol structures
+ * for raw_input routine, then pass them along with
+ * mbuf chain.
+ */
+void
+rip_input(struct mbuf *m, int off)
+{
+	struct ip *ip = mtod(m, struct ip *);
+	int proto = ip->ip_p;
+	struct inpcb *inp, *last;
+
+	INP_INFO_RLOCK(&ripcbinfo);
+	ripsrc.sin_addr = ip->ip_src;
+	last = NULL;
+	LIST_FOREACH(inp, &ripcb, inp_list) {
+		INP_LOCK(inp);
+		if (inp->inp_ip_p && inp->inp_ip_p != proto) {
+	docontinue:
+			INP_UNLOCK(inp);
+			continue;
+		}
+#ifdef INET6
+		if ((inp->inp_vflag & INP_IPV4) == 0)
+			goto docontinue;
+#endif
+		if (inp->inp_laddr.s_addr &&
+		    inp->inp_laddr.s_addr != ip->ip_dst.s_addr)
+			goto docontinue;
+		if (inp->inp_faddr.s_addr &&
+		    inp->inp_faddr.s_addr != ip->ip_src.s_addr)
+			goto docontinue;
+		if (jailed(inp->inp_socket->so_cred))
+			if (htonl(prison_getip(inp->inp_socket->so_cred)) !=
+			    ip->ip_dst.s_addr)
+				goto docontinue;
+		if (last) {
+			struct mbuf *n;
+
+			n = m_copy(m, 0, (int)M_COPYALL);
+			if (n != NULL)
+				(void) raw_append(last, ip, n);
+			/* XXX count dropped packet */
+			INP_UNLOCK(last);
+		}
+		last = inp;
+	}
+	if (last != NULL) {
+		if (raw_append(last, ip, m) != 0)
+			ipstat.ips_delivered--;
+		INP_UNLOCK(last);
+	} else {
+		m_freem(m);
+		ipstat.ips_noproto++;
+		ipstat.ips_delivered--;
+	}
+	INP_INFO_RUNLOCK(&ripcbinfo);
+}
+
+Читая представленный выше код, мы можем различить следующие пункты:
+
+1) Если сырой сокет (type SOCK_RAW) был создан со значением protocol = 0, тогда:
+
+	а) если процесс вызвал bind() и обозначенный адрес совпадает с адресом назначения
+	в датаграмме тогда *ВСЕ* такие датаграммы, которые ядро не знает как обрабатывать
+	передаются этому сырому сокету
+	
+	b) если процес вызвал connect() и обозначенный адрес не совпадает с адресом
+	назначения в датаграмме, тогда *ВСЕ* такие датаграммы которые ядро не знает как
+	обрабатывать , передаются сырому сокету.
+
+	с) если процесс не вызвал bind() и socket(), тогда *ВСЕ* датаграммы которые ядро
+	не знает как обрабатывать передаются этому сырому сокету.
+
+	d) любая комбинация от a до b которая не прошла, значит что датаграмма не
+	предается приложению.
+
+2) Если сырой сокет ( type SOCK_RAW ) создан со значением protocol не равным 0, тогда мы
+имеем следующие варианты:
+
+	a) если значение protocol имеет зарегистрированный обработчик в ядре, приложение
+	*НЕ ПОЛУЧАЕТ* никаких датаграмм ( за исключением ICMP, IGMP которые работают по
+	другому механизму, не обсуждаемому здесь).
+	
+	b) если значение protocol не имеет зарегистрированного обработчика в ядре,
+	приложение получает *только* дататаграммы которые имеют это значение protocol в 
+	заголовке IP.
+
+Вышесказанное может быть выведено из следующего обрезка кода:
+
+		if (inp->inp_ip_p && inp->inp_ip_p != proto) {
+	docontinue:
+			INP_UNLOCK(inp);
+			continue;
+		}
+		if (inp->inp_laddr.s_addr &&
+		    inp->inp_laddr.s_addr != ip->ip_dst.s_addr)
+			goto docontinue;
+		if (inp->inp_faddr.s_addr &&
+		    inp->inp_faddr.s_addr != ip->ip_src.s_addr)
+			goto docontinue;
