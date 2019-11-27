@@ -1232,3 +1232,167 @@ rip_input(struct mbuf *m, int off)
 		if (inp->inp_faddr.s_addr &&
 		    inp->inp_faddr.s_addr != ip->ip_src.s_addr)
 			goto docontinue;
+
+
+Используя логику от обратного, проверка INP_UNLOCK  игнорирует любую датаграмму которая
+имеет не нулевое значение поля protocol и сырой сокет который проверяетcя не имеет этого
+протокола. Это значит, что любой сырой сокет, который определяет значение protocol в 0
+пройдет эту проверку и не будет игнорирован. Тоже самое подходит для любого сырого сокета
+котрый имеет не нулевое значение protocol, но имеет такое же значение protocol как и
+проверяемая датаграмма.
+Тоже применимо к двум проверкам которые слудуют после первой, которые проверяют локальный
+и удаленный адреса ( в случае если были вызваны bind() и/или  connect() ).
+Конечно, случай где  приложение не получает никакой датаграммы хотя и создало сырой
+сокет (но с зарегистрированным протоколом) выходит из факта, что rip_input() в этом
+варианте не будет вызван совсем.
+
+Небольая скобка, чтобы прокоментировать кое-что из man *BSD.
+Man 4 ip конкретно коворит так:
+"Если proto равно 0, по умолчанию для исоходящих пакетов используется протокол
+IPPROTO_RAW, и только входящие для этого протокола принимаются."
+
+Это окончательно сбивает с толку, поскольку это звучит как, создание сырого сокета со
+значением protocol 0  в результате дает, что только пакеты предназначенные для
+IPPROTO_RAW(255) принимаются и никакие больше. Однако это не правда, и автор страниц
+мануала, хочет сказать, что каждая IP датаграмма, которая имеет зачение protocol *в
+результате IP демультиплексирования ip_protox[] указывает на значение IPPROTO_RAW* (
+помните, что все незнакомые протоколы указывают на значение по умолчанию) тогда сокет
+получит эти датаграммы. По этому определению, это верно.
+
+Самое смешное, что указание протокола IPPROTO_RAW при  создании сырого сокета, *обычно*
+будет то , что сокет не получит *любую* датаграмму основываясь на логике выше. Обычно,
+потому, что датаграммы с таким номером протокола не появляются/должны появляться на
+проводе.
+
+Конечно же это не значит, что процесс не может подделать пакет с таким номером протокола и
+отправить его. Это другой случай основной разницы между не должен и не может. В дополнение
+к этому не все подделывающие покеты программы хотят общаться... ( в двух направлениях ).
+На Linux тоже самое произошло бы , поскольку raw_v4_input() вызывается каждый раз и будет
+проверяться если сырой сокет  с номером protocol IPPROTO_RAW существует в user space.
+
+Следующие две небольшие программы демонстрируют функционал IPPROTO_RAW в Linux. Помните из
+части 0x3. IP_HDRINCL что ядро Linux  устанавливает IP_HDRINCL по умолчанию, когда создает
+сокет с IPPROTO_RAW, чтож мы создадим свой собственный заголовок  , чтобы не отправлять
+мусор на провод. Мы будем использовать loopback интерфейс, но тот же самый эффект будет с
+любым настоящим ethernet устройством.
+Обе программы так же работают на FreeBSD/OpenBSD, хотя создание собственного IP заголовка
+не необходимость ( в таком случае netinet/in.h должен использоваться вместо netinet/ip.h)
+
+
+/*** IPPROTO_RAW receiver ***/
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <netinet/ip.h>
+#include <arpa/inet.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+
+int main(void)
+{
+	int s;
+	struct sockaddr_in saddr;
+	char packet[50];
+
+	if ((s = socket(AF_INET, SOCK_RAW, IPPROTO_RAW)) < 0) {
+		perror("error:");
+		exit(EXIT_FAILURE);
+	}
+
+	memset(packet, 0, sizeof(packet));
+	socklen_t *len = (socklen_t *)sizeof(saddr);
+	int fromlen = sizeof(saddr);
+
+	while(1) {
+		if (recvfrom(s, (char *)&packet, sizeof(packet), 0,
+			(struct sockaddr *)&saddr, &fromlen) < 0)
+			perror("packet receive error:");
+
+		int i = sizeof(struct iphdr);	/* print the payload */
+		while (i < sizeof(packet)) {
+			fprintf(stderr, "%c", packet[i]);
+			i++;
+		}
+		printf("\n");
+	}
+	exit(EXIT_SUCCESS);
+}
+
+
+/*** IPPROTO_RAW sender ***/
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <netinet/ip.h>
+#include <arpa/inet.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#define DEST "127.0.0.1"
+
+int main(void)
+{
+
+	int s;
+	struct sockaddr_in daddr;
+	char packet[50];
+	/* point the iphdr to the beginning of the packet */
+	struct iphdr *ip = (struct iphdr *)packet;  
+
+	if ((s = socket(AF_INET, SOCK_RAW, IPPROTO_RAW)) < 0) {
+		perror("error:");
+		exit(EXIT_FAILURE);
+	}
+
+	daddr.sin_family = AF_INET;
+	daddr.sin_port = 0; /* not needed in SOCK_RAW */
+	inet_pton(AF_INET, DEST, (struct in_addr *)&daddr.sin_addr.s_addr);
+	memset(daddr.sin_zero, 0, sizeof(daddr.sin_zero));
+	memset(packet, 'A', sizeof(packet));   /* payload will be all As */
+	
+	ip->ihl = 5;
+	ip->version = 4;
+	ip->tos = 0;
+	ip->tot_len = htons(40);	/* 16 byte value */
+	ip->frag_off = 0;		/* no fragment */
+	ip->ttl = 64;			/* default value */
+	ip->protocol = IPPROTO_RAW;	/* protocol at L4 */
+	ip->check = 0;			/* not needed in iphdr */
+	ip->saddr = daddr.sin_addr.s_addr;
+	ip->daddr = daddr.sin_addr.s_addr;
+
+	while(1) {
+		sleep(1);
+		if (sendto(s, (char *)packet, sizeof(packet), 0, 
+			(struct sockaddr *)&daddr, (socklen_t)sizeof(daddr)) < 0)
+			perror("packet send error:");
+	}
+	exit(EXIT_SUCCESS);
+}
+
+Их запуск в результате даст прекрасное взаимодействие между ними, поскольку ничто их не
+останавливает от использования IPPROTO_RAW(255) как L4 протокол.
+
+#./send
+
+#tcpdump -i lo -X -vv
+
+19:49:27.048431 IP (tos 0x0, ttl 64, id 16705, offset 0, flags [none], 
+proto unknown (255), length 50) localhost.localdomain > localhost.localdomain:
+ip-proto-255 30
+        0x0000:  4500 0032 4141 0000 40ff 3a8a 7f00 0001  E..2AA..@.:.....
+        0x0010:  7f00 0001 4141 4141 4141 4141 4141 4141  ....AAAAAAAAAAAA
+        0x0020:  4141 4141 4141 4141 4141 4141 4141 4141  AAAAAAAAAAAAAAAA
+        0x0030:  4141                                     AA
+19:49:28.048466 IP (tos 0x0, ttl 64, id 16705, offset 0, flags [none], 
+proto unknown (255), length 50) localhost.localdomain > localhost.localdomain:
+ip-proto-255 30
+        0x0000:  4500 0032 4141 0000 40ff 3a8a 7f00 0001  E..2AA..@.:.....
+        0x0010:  7f00 0001 4141 4141 4141 4141 4141 4141  ....AAAAAAAAAAAA
+        0x0020:  4141 4141 4141 4141 4141 4141 4141 4141  AAAAAAAAAAAAAAAA
+        0x0030:  4141  
+
+#./recv
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
