@@ -1460,7 +1460,7 @@ Linux.
 
 
 
-0x5. raw output
+0x5. raw вывод
 ===============
 
 Зная как обрабатывается raw датаграммы, мы готовы рассмотреть в деталях raw output
@@ -1472,3 +1472,213 @@ Linux.
 
 a. Linux
 ********
+
+Главный обработчик выводы сырого сокета это raw_sendmsg() который объявляется в 
+/usr/src/linux.2.6*/net/ipv4/raw.c:
+
+
+static int raw_sendmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
+		       size_t len)
+{
+	struct inet_sock *inet = inet_sk(sk);
+	struct ipcm_cookie ipc;
+	struct rtable *rt = NULL;
+	/* ... */
+	if (inet->hdrincl)
+		err = raw_send_hdrinc(sk, msg->msg_iov, len,
+					rt, msg->msg_flags);
+
+	/* ... */
+
+}
+
+Если IP_HDRINCL был установлен тогда вызывается  raw_send_hdrinc() ( который определяется
+в том же  файле):
+
+
+static int raw_send_hdrinc(struct sock *sk, void *from, size_t length,
+			struct rtable *rt,
+			unsigned int flags)
+{
+	/* ... */
+	if (length > rt->u.dst.dev->mtu) {
+		ip_local_error(sk, EMSGSIZE, rt->rt_dst, inet->dport,
+			       rt->u.dst.dev->mtu);
+		return -EMSGSIZE;
+	}
+
+
+	/* We don't modify invalid header */
+	iphlen = iph->ihl * 4;
+	if (iphlen >= sizeof(*iph) && iphlen <= length) {
+		if (!iph->saddr)
+			iph->saddr = rt->rt_src;
+		iph->check   = 0;
+		iph->tot_len = htons(length);
+		if (!iph->id)
+			ip_select_ident(iph, &rt->u.dst, NULL);
+
+		iph->check = ip_fast_csum((unsigned char *)iph, iph->ihl);
+	}
+	if (iph->protocol == IPPROTO_ICMP)
+		icmp_out_count(((struct icmphdr *)
+			skb_transport_header(skb))->type);
+
+	err = NF_HOOK(PF_INET, NF_IP_LOCAL_OUT, skb, NULL, rt->u.dst.dev,
+		      dst_output);
+
+	/* ... */
+}
+
+Код который там предствлен довольно  очевидный. Если проложение не определяет к IP адрес
+источника, тогда это делает ядро. Тоже самое происходит с идентификационным номером IP.
+Два поля которые всегда заполняются здесь: чексумма IP датаграммы ( надеюсь,  для нас - это
+спасает нас от  неприятнойстей) и полная длинна iph->tot_len датаграммы (здесь нет
+коррупции).Представленное выше, подтверждется man 7 raw:
+ 
+              +---------------------------------------------------+
+              |IP Header fields modified on sending by IP_HDRINCL |
+              +----------------------+----------------------------+
+              |IP Checksum           |Always filled in.           |
+              +----------------------+----------------------------+
+              |Source Address        |Filled in when zero.        |
+              +----------------------+----------------------------+
+              |Packet Id             |Filled in when zero.        |
+              +----------------------+----------------------------+
+              |Total Length          |Always filled in.           |
+              +----------------------+----------------------------+
+
+Обратите внимание на конец, вызываетс функция dst_output() и IP уровень не вызывается
+совсем. Это имеет один негативный эффект в результате( не смотря на то, что для
+производительности это лучше): если будет необходимо, не произойдет IP фрагментация. Это
+значит, что сырой пакет больше чем MTU интерфейса, возможно будет отброшен. Вместо
+ip_local_error(), который произодит общую  чистку sk_buff , вызывается и возвращается
+ошибка EMSGSIZE. С другой стороны, нормальная raw сокет  фрагментация происходит когда, мы
+не включаем наш собственный IP заголовок.
+
+b. FreeBSD
+**********
+
+Сырой вывод на FreeBSD обрабатвается rip_output(). Однако, целая Цепочка ядерных функций 
+вызывается до того как мы добермся до rip_output().
+Первая sosend_generic() которая определена в /usr/src/sys/kern/uipc_socket.c, обращается к 
+структуре pr_usrreqs (user request) и создает вызов как здесь:
+
+	*so->so_proto->pr_usrreqs->pru_send(...)
+
+, где so - это тип структуры socket *so.
+
+so_proto - это указатель на стукруру    protosw* и указатели на протокол сокета.
+pr_usrreqs - это стуктура члены которой - указатели на функции которые используются
+протоколом для обслуживания запросов приходящих из уровня socket(как правило, выполняется
+системными вызовами на уровне приложения).
+
+Для RAW протокола pr_usrreq и это определяется в /usr/src/sys/kern/raw_ip.c просто до
+конца файла:
+
+struct pr_usrreqs rip_usrreqs = {
+	.pru_abort =		rip_abort,
+	.pru_attach =		rip_attach,
+	.pru_bind =		rip_bind,
+	.pru_connect =		rip_connect,
+	.pru_control =		in_control,
+	.pru_detach =		rip_detach,
+	.pru_disconnect =	rip_disconnect,
+	.pru_peeraddr =		in_getpeeraddr,
+	.pru_send =		rip_send,
+	.pru_shutdown =		rip_shutdown,
+	.pru_sockaddr =		in_getsockaddr,
+	.pru_sosetlabel =	in_pcbsosetlabel,
+};
+
+
+Это значит, что вызывая *so->so_proto->pr_usrreqs->pru_send(...) на сырой сокет, будет
+вызван rip_send() который определяется в raw_ip.c и вызывает rip_output() которым 
+мы и будем   семи себя занимать.
+
+static int
+rip_send(struct socket *so, int flags, struct mbuf *m, struct sockaddr *nam,
+    struct mbuf *control, struct thread *td)
+{
+	struct inpcb *inp;
+	u_long dst;
+
+	/* ... */
+	return rip_output(m, so, dst);
+}
+
+rip_output() будет или частично cоставлять IP заголовок до того как пакет будет передан IP
+уровню, или в случае у нас устанволен IP_HDRINCL как не-должен-быть-изменен установкой
+флага IP_RAWOUTPUT. В конце  вызывается ip_output() и остается спокойным на данный момент.
+
+/*
+ * Generate IP header and pass packet to ip_output.
+ * Tack on options user may have setup with control call.
+ */
+int
+rip_output(struct mbuf *m, struct socket *so, u_long dst)
+{
+	struct ip *ip;
+	int error;
+	struct inpcb *inp = sotoinpcb(so);
+	int flags = ((so->so_options & SO_DONTROUTE) ? IP_ROUTETOIF : 0) |
+	    IP_ALLOWBROADCAST;
+
+	/*
+	 * If the user handed us a complete IP packet, use it.
+	 * Otherwise, allocate an mbuf for a header and fill it in.
+	 */
+	if ((inp->inp_flags & INP_HDRINCL) == 0) {
+		if (m->m_pkthdr.len + sizeof(struct ip) > IP_MAXPACKET) {
+			m_freem(m);
+			return(EMSGSIZE);
+		}
+		M_PREPEND(m, sizeof(struct ip), M_DONTWAIT);
+		if (m == NULL)
+			return(ENOBUFS);
+
+		INP_LOCK(inp);
+		ip = mtod(m, struct ip *);
+		ip->ip_tos = inp->inp_ip_tos;
+		if (inp->inp_flags & INP_DONTFRAG)
+			ip->ip_off = IP_DF;
+		else
+			ip->ip_off = 0;
+		ip->ip_p = inp->inp_ip_p;	/* write XXX protocol value mentioned
+						in socket(AF_INET, SOCK_RAW , XXX) */
+		ip->ip_len = m->m_pkthdr.len;
+		if (jailed(inp->inp_socket->so_cred))
+			ip->ip_src.s_addr =
+			    htonl(prison_getip(inp->inp_socket->so_cred));
+		else
+			ip->ip_src = inp->inp_laddr;
+		ip->ip_dst.s_addr = dst;
+		ip->ip_ttl = inp->inp_ip_ttl;
+	} else {
+		/* checks */
+		/* ... */
+
+		/* don't allow both user specified and setsockopt options,
+		   and don't allow packet length sizes that will crash */
+		if (((ip->ip_hl != (sizeof (*ip) >> 2))
+		     && inp->inp_options)
+		    || (ip->ip_len > m->m_pkthdr.len)
+		    || (ip->ip_len < (ip->ip_hl << 2))) {
+			INP_UNLOCK(inp);
+			m_freem(m);
+			return EINVAL;
+		}
+		if (ip->ip_id == 0)
+			ip->ip_id = ip_newid();
+		/* XXX prevent ip_output from overwriting header fields */
+		flags |= IP_RAWOUTPUT;
+		ipstat.ips_rawout++;
+	}
+
+	/* ... */
+
+	error = ip_output(m, inp->inp_options, NULL, flags,
+	    inp->inp_moptions, inp);
+	INP_UNLOCK(inp);
+	return error;
+}
