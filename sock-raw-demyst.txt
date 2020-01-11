@@ -1682,3 +1682,184 @@ rip_output(struct mbuf *m, struct socket *so, u_long dst)
 	INP_UNLOCK(inp);
 	return error;
 }
+
+
+Что касается случая, кода ядро самостоятельно готовит заголовок, это стоит  времени,
+что-бы упомянуть, что поле Protocol,  IP заголовка заполняется значением указанным в
+socket(AF_INET, SOCK_RAW, XXX) и *не* IPPROTO_RAW даже если  запись default_RAW является
+его обработчиком.
+Пример который нам интересен показан ниже условия else, (случай где пользователь передает
+весь IP пакет с заголовком). Что ж, в преждние времена пакет большой длинны потенциально
+мог сломать кое-что, поскольку проверки ip_len( полная длинна датаграммы) тогда не было.
+Другая интересная вещь здесь - это то, что ядро будет использовать случайное значение для
+установки ip_id (номер для идентификации - используемый при фрагментации) если он был
+оаствлен со значением 0. Следующая вещь - это флаг IP_RAWOUTPUT который мы упомянули
+ранее. Мы собираемся увидеть как это будет влиять на ip_output(), который определяется в
+одноименном .с файле /usr/src/sys/netinet/ip_output.c:
+
+
+int
+ip_output(struct mbuf *m, struct mbuf *opt, struct route *ro, int flags,
+    struct ip_moptions *imo, struct inpcb *inp)
+{
+
+	/* ... */
+
+	if ((flags & (IP_FORWARDING|IP_RAWOUTPUT)) == 0) {
+		ip->ip_v = IPVERSION;
+		ip->ip_hl = hlen >> 2;
+		ip->ip_id = ip_newid();
+		ipstat.ips_localout++;
+	} else {
+		hlen = ip->ip_hl << 2;
+	}
+
+	/* ... */
+
+	/*
+	 * If small enough for interface, or the interface will take
+	 * care of the fragmentation for us, we can just send directly.
+	 */
+
+	/* ... */
+	ip->ip_sum = 0;
+	if (sw_csum & CSUM_DELAY_IP)
+		ip->ip_sum = in_cksum(m, hlen);
+
+	/* ... */
+	/*
+	 * If the source address is not specified yet, use the address
+	 * of the outoing interface.
+	 */
+	if (ip->ip_src.s_addr == INADDR_ANY) {
+		/* Interface may have no addresses. */
+		if (ia != NULL) {
+			ip->ip_src = IA_SIN(ia)->sin_addr;
+		}
+	}
+	/* ... */
+}
+
+
+Как мы можем легко увидеть здесь, если пакет промаркирован флагом IP_RAWOUTPUT тогда (
+почти) тогда ниодно поле не будет обработано ядром. Для нас всегда вычисляется 
+*только* IP checksum. В дополнение к этому, если приложение не указало никакого адреса
+источника, тогда используется ip адрес исходящего интерфейса. В основном пользователь
+имеет полный доступ над IP заголовком.
+После того как ip_output() закончил обработку пакета, он передается более низкоуровневой
+функции  if_output() внутреннее устройство которой выходит за рамки этого текста. В
+противоположность Linux, сырые сокеты на FreeBSD будут всегда(даже если мы добавим свой IP
+заголовок) фрагментированы, если нужно, давая пользователю больше гибкости при создании
+больших пакетов.
+
+0x6. Описание
+=============
+
+Результат исследования данной статьи может быть cуммирован в следующих схемах:
+
+
+a. Linux
+********
+
+socket(AF_INET, SOCK_RAW, 0); --> EPPROTONOSUPPORT
+-----------------------------
+
+socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+---------------------------------------
+	|			|      	
+	|               	|
+     ---------	 	     ----------
+     | input |               | output |
+     ---------               ----------
+    only datagrams	IP_HDRINCL  : protocol: (user specified)
+    with a procotol	(it is by default set)
+    field: 255
+    (IPPROTO_RAW)
+
+
+socket(AF_INET, SOCK_RAW, XXX);
+-------------------------------
+	|		|      	
+	|               |
+     ---------	     ----------
+     | input |       | output |
+     ---------       ----------
+    only datagrams	IP_HDRINCL  : protocol: (user specified)
+    with a procotol	!IP_HDRINCL : protocol: XXX
+    field: XXX
+    (whatever that
+    may be)
+
+
+
+b. FreeBSD
+**********
+
+socket(AF_INET, SOCK_RAW, 0);
+---------------------------------------
+	|			|      	
+	|               	|
+     ---------	 	     ----------
+     | input |               | output |
+     ---------               ----------
+    all raw datagrams	IP_HDRINCL  : protocol: (user specified)
+    			!IP_HDRINCL : 0
+    
+    
+
+socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+---------------------------------------
+	|			|      	
+	|               	|
+     ---------	 	     ----------
+     | input |               | output |
+     ---------               ----------
+    only datagrams	IP_HDRINCL: protocol: (user specified)
+    with a procotol	!IP_HDRINCL : IPPROTO_RAW
+    field: 255
+    (IPPROTO_RAW)
+
+
+socket(AF_INET, SOCK_RAW, XXX);
+-------------------------------
+	|		|      	
+	|               |
+     ---------	     ----------
+     | input |       | output |
+     ---------       ----------
+    only datagrams	IP_HDRINCL  : protocol: (user specified)
+    with a procotol	!IP_HDRINCL : protocol: XXX
+    field: XXX
+    and only
+    *unregistered*
+    protocols
+
+
+
+0x7. Заключение
+===============
+
+Без сомнений SOCK_RAW это мощный тип сокета, который заслуживает вннимания любого, кто
+интересуется низкоуровненым сетевым програмированием. То что мы обсудили в этой статье это
+быстрый взляд на сложное внутреннее устройство двух наиболее популярных сетевых стэков
+относительно сырых сокетов. Реализация механизма сырых сокетов может звучать сложно, но на
+самом деле может предоставить хорошую точку отправки для любого, кто желает окунуться в
+детали того, что представляет собой основы интернета. Я надеюсь этот текст будет
+предоставлять всестороннее руководство сам по себе, но я настоятельно рекомендую любому ,
+у кого есть интерес к этому материалу, взять в руки все книги указанные в Источниках. Они
+доказали свою неоценимость и в деталях объясняют многое вещи которые большинство принимают
+как должное.
+
+На будущее, я надеюсь написать текс более ориентированный на безопасность, что так же
+выходит за рамки базового материала обсуждаемого здесь и  будет иметь дело с некоторымы
+необщими случаями котые скрываются в закоулках сети.
+
+
+0x8. References
+===============
+
+1. TCP/IP Illustrated Vol.2 The Implementation 
+2. Unix Network Programming - The Sockets Networking API 
+3. Understanding Linux Network Internals
+4. kernel sources of Linux.2.6.24 and FreeBSD-7.0
+
